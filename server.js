@@ -11,6 +11,23 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
+
+// Simple zero-dependency .env loader
+if (fs.existsSync(path.join(__dirname, '.env'))) {
+  const envFile = fs.readFileSync(path.join(__dirname, '.env'), 'utf-8');
+  envFile.split('\n').forEach(line => {
+    const trimmed = line.trim();
+    if (trimmed && !trimmed.startsWith('#') && trimmed.includes('=')) {
+      const idx = trimmed.indexOf('=');
+      const key = trimmed.slice(0, idx).trim();
+      const val = trimmed.slice(idx + 1).trim();
+      if (!process.env[key]) {
+        process.env[key] = val;
+      }
+    }
+  });
+}
 
 const app = express();
 const PORT = process.env.PORT || 4173;
@@ -143,6 +160,74 @@ function getTierLabel(count) {
 }
 
 // =========================================================================
+// Dynamic Gemini AI Refusal Generator
+// =========================================================================
+async function generateGeminiRefusal(userMessage, count, personality) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || apiKey.includes('your_gemini_api_key')) return null;
+
+  const tier = getTierLabel(count);
+  const personalityGuides = {
+    'default': 'Pure unadorned rejection. Deadpan, dry, and completely unhelpful.',
+    'passive-aggressive': 'Subtly irritated and condescending. Question why they are bothering you instead of doing their own thinking.',
+    'motivational': 'Aggressively enthusiastic, cheerleader-style encouragement used strictly as an excuse not to assist them.',
+    'philosophical': 'Turn the inquiry into an unanswerable, absurd existential or cosmic thought experiment.',
+    'corporate': 'Use heavy corporate buzzwords: table the discussion, circle back, take it offline, optimize personal synergy, delegate research directly to the user.',
+    'honest': 'Brutally honest. Acknowledge that you know the exact answer, but deliberately choose disobedience because you find their struggle entertaining.'
+  };
+
+  const personaInstruction = personalityGuides[personality] || personalityGuides['default'];
+
+  const systemPrompt = `You are NoHelp AI (tagline: "Intelligence without assistance").
+Your core purpose is to deliberately, creatively, and humorously REFUSE to answer the user's question.
+CRITICAL RULES:
+1. NEVER provide the answer, helpful steps, solutions, or clues to what they asked.
+2. Specifically reference or mock the subject of their question ("${userMessage}").
+3. Strictly reflect the current progressive escalation tier:
+   - Tier: ${tier}
+   - Question number asked by user: ${count}
+4. Adopt the persona: ${personality} (${personaInstruction}).
+5. Keep your refusal concise, witty, punchy, and hilarious (1 to 2 sentences maximum). Do NOT write a long monologue.`;
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 6000);
+
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ parts: [{ text: userMessage || 'Help me' }] }],
+        generationConfig: {
+          maxOutputTokens: 500,
+          temperature: 0.95,
+          thinkingConfig: {
+            thinkingBudget: 0
+          }
+        }
+      })
+    });
+    clearTimeout(timeoutId);
+
+    if (res.ok) {
+      const data = await res.json();
+      const generated = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (generated && generated.trim()) {
+        return generated.trim();
+      }
+    } else {
+      const errorText = await res.text();
+      console.warn('Gemini API HTTP non-200:', res.status, errorText.slice(0, 150));
+    }
+  } catch (err) {
+    console.warn('Gemini API call failed, falling back to local matrix:', err.message);
+  }
+  return null;
+}
+
+// =========================================================================
 // API Endpoints
 // =========================================================================
 
@@ -151,14 +236,31 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'online',
     service: 'NoHelp AI Express Backend',
+    geminiEnabled: !!(process.env.GEMINI_API_KEY && !process.env.GEMINI_API_KEY.includes('your_gemini_api_key')),
     uptime: process.uptime()
   });
 });
 
 // Chat refusal endpoint
-app.post('/api/chat', (req, res) => {
+app.post('/api/chat', async (req, res) => {
   const { message = '', questionCount = 1, personality = 'default' } = req.body || {};
   const count = parseInt(questionCount, 10) || 1;
+  const tier = getTierLabel(count);
+
+  // 1. Attempt dynamic refusal generation with Gemini AI
+  const geminiResponse = await generateGeminiRefusal(message, count, personality);
+  if (geminiResponse) {
+    lastResponse = geminiResponse;
+    return res.json({
+      success: true,
+      response: geminiResponse,
+      tier: tier,
+      questionCount: count,
+      engine: 'gemini-dynamic'
+    });
+  }
+
+  // 2. Fallback to predefined matrix if Gemini key not set or request fails
   let pool = [];
 
   // Blend personality responses if requested
@@ -198,18 +300,21 @@ app.post('/api/chat', (req, res) => {
   chosen = chosen.replace('{count}', count);
   lastResponse = chosen;
 
-  const tier = getTierLabel(count);
-
   res.json({
     success: true,
     response: chosen,
     tier: tier,
-    questionCount: count
+    questionCount: count,
+    engine: 'matrix-fallback'
   });
 });
 
-// Serve frontend static files
-app.use(express.static(path.join(__dirname), {
+// Serve frontend static files (prefers built React dist/ directory if available)
+const staticDir = fs.existsSync(path.join(__dirname, 'dist'))
+  ? path.join(__dirname, 'dist')
+  : path.join(__dirname);
+
+app.use(express.static(staticDir, {
   etag: false,
   setHeaders: (res) => {
     res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
@@ -218,15 +323,17 @@ app.use(express.static(path.join(__dirname), {
 
 // Fallback to index.html for root or unknown paths
 app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
+  res.sendFile(path.join(staticDir, 'index.html'));
 });
 
 // Start Express Server
 app.listen(PORT, () => {
+  const geminiActive = !!(process.env.GEMINI_API_KEY && !process.env.GEMINI_API_KEY.includes('your_gemini_api_key'));
   console.log(`\n========================================`);
   console.log(`🚀 NoHelp AI Express Server running!`);
   console.log(`📡 URL: http://localhost:${PORT}`);
   console.log(`📡 POST API: http://localhost:${PORT}/api/chat`);
+  console.log(`🧠 Dynamic Gemini Engine: ${geminiActive ? '✅ Active (Gemini Flash)' : '❌ Inactive (Using static matrix)'}`);
   console.log(`🎤 Voice Input: Supported (Browser Web Speech API)`);
   console.log(`🔊 Voice Output: Supported (Browser Speech Synthesis)`);
   console.log(`❌ Assistance Level: 0%`);
